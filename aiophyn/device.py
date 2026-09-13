@@ -65,6 +65,23 @@ class Device:
             "get", f"{API_BASE}/devices/{device_id}/consumption/details", params=params
         )
 
+    async def get_water_usage_events(self, device_id: str, from_ts: int, to_ts: int) -> list:
+        """Return individual water-usage events for a PP/PC device.
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :param from_ts: Start of window, millisecond epoch integer
+        :type from_ts: int
+        :param to_ts: End of window, millisecond epoch integer
+        :type to_ts: int
+        :return: List of event dicts with keys: id, device_id, product_code,
+                 total_flow, flow_rate, open_edge_timestamp, close_edge_timestamp,
+                 latest_suggested_fixtures_result, latest_user_feedback.
+        :rtype: list[dict]
+        """
+        params = {"device_id": device_id, "from_ts": from_ts, "to_ts": to_ts}
+        return await self._request("get", f"{API_BASE}/water-usage-events", params=params)
+
     async def get_water_statistics(self, device_id: str, from_ts, to_ts):
         """Get statistics about a PW1 sensor
 

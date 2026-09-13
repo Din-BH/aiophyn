@@ -36,7 +36,7 @@ async def main() -> None:
             alerts = await api.alert.get_latest(USERNAME, home_id, alert_type=Alert.ALERT_TYPES)
             _LOGGER.info("latest alerts (%d): %s", len(alerts), alerts)
 
-            summary = await api.alert.get_active_summary(USERNAME)
+            summary = await api.alert.get_active_summary(USERNAME, "unresolved")
             _LOGGER.info("active summary: %s", summary)
 
             # if alerts:

@@ -19,8 +19,23 @@ from .const import API_BASE
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long to wait for the _on_disconnect callback before giving up.
+# A missing callback (e.g. when MQTT is already down at unload time) would
+# otherwise block disconnect_and_wait forever — the root cause of the reload
+# hang described in issues #56 / #60.
+_DISCONNECT_WAIT_TIMEOUT: float = 10.0
+
 class AIOHelper:
-    """Helper class for Asynchronous IO"""
+    """Helper class for Asynchronous IO
+
+    paho-mqtt invokes the socket callbacks from whichever thread drives the
+    client. ``MQTTClient.connect()`` runs ``paho.connect()`` in an executor,
+    so ``on_socket_open`` (and the write-register callbacks issued while
+    sending CONNECT) arrive on a worker thread. Event-loop methods such as
+    ``add_reader`` and ``create_task`` are not thread-safe, so every callback
+    is marshalled onto the loop thread with ``call_soon_threadsafe`` when
+    needed (issue #67).
+    """
     def __init__(self, client: paho_mqtt.Client) -> None:
         self.loop = asyncio.get_running_loop()
         self.client = client
@@ -31,6 +46,17 @@ class AIOHelper:
             self._on_socket_unregister_write
         self.misc_task: Optional[asyncio.Task] = None
 
+    def _run_on_loop(self, func, *args) -> None:
+        """Run ``func`` on the event-loop thread, directly if already there."""
+        try:
+            on_loop_thread = asyncio.get_running_loop() is self.loop
+        except RuntimeError:
+            on_loop_thread = False
+        if on_loop_thread:
+            func(*args)
+        else:
+            self.loop.call_soon_threadsafe(func, *args)
+
     def _on_socket_open(self,
                         client: paho_mqtt.Client,
                         userdata: Any,
@@ -38,12 +64,20 @@ class AIOHelper:
                         ) -> None:
         # pylint: disable=unused-argument
         _LOGGER.info("MQTT Socket Opened")
+        self._run_on_loop(self._socket_open_on_loop, client, sock)
+
+    def _socket_open_on_loop(self, client: paho_mqtt.Client, sock: socket.socket) -> None:
         self.loop.add_reader(sock, client.loop_read)
+        if self.misc_task is not None and not self.misc_task.done():
+            self.misc_task.cancel()
         self.misc_task = self.loop.create_task(self.misc_loop())
 
     def _on_socket_close(self, client: paho_mqtt.Client, userdata: Any, sock: socket.socket) -> None:
         # pylint: disable=unused-argument
         _LOGGER.info("MQTT Socket Closed")
+        self._run_on_loop(self._socket_close_on_loop, sock)
+
+    def _socket_close_on_loop(self, sock: socket.socket) -> None:
         self.loop.remove_reader(sock)
         if self.misc_task is not None:
             self.misc_task.cancel()
@@ -54,7 +88,7 @@ class AIOHelper:
                                   sock: socket.socket
                                   ) -> None:
         # pylint: disable=unused-argument
-        self.loop.add_writer(sock, client.loop_write)
+        self._run_on_loop(self.loop.add_writer, sock, client.loop_write)
 
     def _on_socket_unregister_write(self,
                                     client: paho_mqtt.Client,
@@ -62,7 +96,7 @@ class AIOHelper:
                                     sock: socket.socket
                                     ) -> None:
         # pylint: disable=unused-argument
-        self.loop.remove_writer(sock)
+        self._run_on_loop(self.loop.remove_writer, sock)
 
     async def misc_loop(self) -> None:
         """Loop for MQTT"""
@@ -150,6 +184,7 @@ class MQTTClient:
 
     async def connect(self):
         """ Create a conenction to the MQTT server """
+        self.disconnect_evt = None
         self.host, path = await self.get_mqtt_info()
         self.client.ws_set_options(path, headers={'Host': self.host})
 
@@ -177,14 +212,22 @@ class MQTTClient:
             )
     
     def disconnect(self):
-        """Disconnect from server"""
+        """Disconnect from server.
+
+        This is an intentional disconnect: ``disconnect_evt`` stays set
+        afterwards so that a late ``_on_disconnect`` callback does not spawn
+        a reconnect loop on a client the caller has discarded.  ``connect()``
+        clears it again.
+        """
         self.disconnect_evt = asyncio.Event()
         _LOGGER.info("MQTT client disconnecting...")
 
-        # An in-flight reconnect loop (spawned by _on_disconnect or
+        # Stop the reconnect machinery: the hourly keepalive timer would
+        # otherwise resurrect this client via _process_reconnect, and an
+        # in-flight reconnect loop (spawned by _on_disconnect or
         # _process_reconnect) should not keep retrying past an explicit
-        # disconnect request, and letting it run also races with the
-        # disconnect below.
+        # disconnect request.
+        self.reconnect_timer.cancel()
         if self.connect_task is not None and not self.connect_task.done():
             self.connect_task.cancel()
 
@@ -199,21 +242,25 @@ class MQTTClient:
 
         self.client.disconnect()
 
-    async def disconnect_and_wait(self, timeout: float = 10.0):
-        """Disconnect from server and wait.
+    async def disconnect_and_wait(self, timeout: Optional[float] = None) -> None:
+        """Disconnect from the server and wait for the callback to confirm.
 
-        Bounded by `timeout` so a caller that omits its own timeout can't
-        be left hanging on a disconnect that paho-mqtt never acks (this
-        can happen even when the socket does look connected, e.g. a dead
-        peer with no FIN yet observed).
+        Returns promptly when the client is already disconnected (paho never
+        fires ``on_disconnect`` in that case).  Bounded by ``timeout``
+        (default ``_DISCONNECT_WAIT_TIMEOUT``) so a caller that omits its own
+        timeout can't be left hanging on a disconnect that paho-mqtt never
+        acks, e.g. a dead peer with no FIN observed yet.
         """
+        if timeout is None:
+            timeout = _DISCONNECT_WAIT_TIMEOUT
         self.disconnect()
         try:
             await asyncio.wait_for(self.disconnect_evt.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             _LOGGER.warning(
-                "Timed out waiting for MQTT on_disconnect callback; "
-                "proceeding as disconnected"
+                "Timed out after %ss waiting for MQTT disconnect callback; "
+                "proceeding as disconnected",
+                timeout,
             )
 
     async def get_mqtt_info(self):
@@ -236,12 +283,20 @@ class MQTTClient:
     async def subscribe(self, topic):
         """Subscribe to a MQTT topic"""
         _LOGGER.info("Attempting to subscribe to: %s", topic)
-        res, msg_id = self.client.subscribe(topic, 0)
-        self.pending_acks[msg_id] = topic
- 
+        # Track subscription intent (not SUBACK) so the reconnect loop
+        # re-subscribes even if the ack is lost or the connection drops
+        # before it arrives.
         if topic not in self.topics:
             self.topics.append(topic)
-
+        res, msg_id = self.client.subscribe(topic, 0)
+        if res != paho_mqtt.MQTT_ERR_SUCCESS:
+            _LOGGER.warning(
+                "Subscribe to %s failed (%s); will retry on reconnect",
+                topic,
+                paho_mqtt.error_string(res),
+            )
+            return
+        self.pending_acks[msg_id] = topic
 
     def _on_connect(self,
                     client: paho_mqtt.Client,
@@ -357,7 +412,8 @@ class MQTTClient:
                         _LOGGER.info("Timeout while waiting for MQTT connection")
                         continue
 
-                    # Re-subscribe to all topics
+                    # Re-subscribe to all topics; drop acks from the old session.
+                    self.pending_acks.clear()
                     topics = list(set(self.topics))
                     tasks = [self.subscribe(topic) for topic in topics]
                     await asyncio.gather(*tasks)
@@ -373,7 +429,6 @@ class MQTTClient:
             # Always release the reconnect lock and clean up task/event state so
             # that subsequent disconnect events can trigger a new reconnect attempt.
             self.reconnect_evt.clear()
-            self.disconnect_evt = None
             self.connect_task = None
 
     def _on_message(
@@ -409,4 +464,3 @@ class MQTTClient:
             del self.pending_acks[mid]
         else:
             _LOGGER.info("Subscribed: %s %s %s", userdata, str(mid), str(granted_qos))
-

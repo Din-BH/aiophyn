@@ -32,6 +32,7 @@ class Alert:
         home_id: str,
         alert_type: Union[str, List[str]],
         limit: int = 100,
+        filter_type: Optional[str] = None,
     ) -> list:
         """Return the latest alerts for a home.
 
@@ -48,6 +49,9 @@ class Alert:
         :type alert_type: ``str`` or ``list``
         :param limit: Maximum number of alerts to return, defaults to 100
         :type limit: ``int``
+        :param filter_type: Optional server-side filter, e.g. ``resolved``
+            or ``unresolved``. Omitted from the request when ``None``.
+        :type filter_type: ``str`` or ``None``
         :rtype: ``list``
         """
         if isinstance(alert_type, list):
@@ -58,6 +62,8 @@ class Alert:
             "type": alert_type,
             "limit": limit,
         }
+        if filter_type is not None:
+            params["filter_type"] = filter_type
         return await self._request("get", f"{API_BASE}/alerts/latest", params=params)
 
     async def get_active_summary(
